@@ -1,10 +1,16 @@
 """Set WWVLLM_TEST_MODEL to enable the single-GPU speculative integration test."""
 import os
+import subprocess
+import sys
 import pytest
 
 
 @pytest.mark.skipif(not os.getenv('WWVLLM_TEST_MODEL'), reason='set WWVLLM_TEST_MODEL')
 def test_gpu_speculation_matches_normal_and_forced_rejection():
+    if not os.getenv('WWVLLM_SPEC_TEST_CHILD'):
+        env = dict(os.environ, WWVLLM_SPEC_TEST_CHILD='1')
+        subprocess.run([sys.executable, '-m', 'pytest', '-q', __file__], env=env, check=True)
+        return
     import torch
     from wwvllm import LLM, SamplingParams
     model = os.environ['WWVLLM_TEST_MODEL']

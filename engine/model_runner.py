@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from wwvllm.config import Config
 from wwvllm.engine.sequence import Sequence
-from wwvllm.models.qwen3 import Qwen3ForCausalLM
+from wwvllm.models.registry import get_model_class
 from wwvllm.layers.sampler import Sampler
 from wwvllm.utils.context import set_context, get_context, reset_context
 from wwvllm.utils.loader import load_model
@@ -20,7 +20,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        self.enforce_eager = config.enforce_eager or getattr(config.hf_config, "model_type", None) == "qwen3_moe"
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -31,8 +31,15 @@ class ModelRunner:
         try:
             torch.set_default_dtype(hf_config.dtype)
             torch.set_default_device("cuda")
-            self.model = Qwen3ForCausalLM(hf_config)
-            load_model(self.model, config.model)
+            self.model = get_model_class(hf_config)(hf_config)
+            if config.quantization in ('awq', 'gptq'):
+                from wwvllm.quantization.checkpoint import load_quantized_model
+                load_quantized_model(self.model, config.model, hf_config.quantization_config)
+            else:
+                load_model(self.model, config.model)
+                if config.quantization:
+                    from wwvllm.quantization.linear import quantize_model
+                    quantize_model(self.model, 4 if config.quantization == 'int4' else 8, config.quant_group_size)
             self.sampler = Sampler()
             self.draft_runner = None
             if config.enable_speculative:

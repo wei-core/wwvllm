@@ -8,6 +8,8 @@ class Config:
     model: str
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
+    quantization: str | None = None
+    quant_group_size: int = 128
     prefill_chunk_size: int = 512
     max_pending_requests: int = 1024
     enable_speculative: bool = False
@@ -26,6 +28,10 @@ class Config:
     def __post_init__(self):
         if min(self.max_num_batched_tokens, self.max_num_seqs, self.prefill_chunk_size, self.max_pending_requests) < 1:
             raise ValueError("scheduler limits must be positive")
+        if self.quantization not in (None, 'int8', 'int4', 'awq', 'gptq') or self.quant_group_size < 1:
+            raise ValueError("quantization must be None, int8, int4, awq or gptq; group size must be positive")
+        if self.quantization and self.tensor_parallel_size != 1:
+            raise ValueError("quantized execution requires tensor_parallel_size=1")
         if self.enable_speculative:
             if not self.speculative_model or not os.path.isdir(self.speculative_model):
                 raise ValueError("speculative_model must be an existing model directory")
@@ -37,4 +43,16 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if getattr(self.hf_config, 'model_type', None) == 'qwen3_moe' and self.tensor_parallel_size != 1:
+            raise ValueError("Qwen3 MoE reference backend requires tensor_parallel_size=1")
+        metadata = getattr(self.hf_config, 'quantization_config', None)
+        if metadata:
+            method = metadata.get('quant_method', '').lower()
+            if method not in ('awq', 'gptq') or self.quantization not in (None, method):
+                raise ValueError("unsupported or mismatched quantized checkpoint format")
+            if self.tensor_parallel_size != 1:
+                raise ValueError("quantized execution requires tensor_parallel_size=1")
+            self.quantization = method
+        elif self.quantization in ('awq', 'gptq'):
+            raise ValueError("AWQ/GPTQ requires checkpoint quantization metadata")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

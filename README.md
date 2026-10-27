@@ -42,3 +42,13 @@ finally:
 ```
 
 Run `PYTHONPATH=.. python -m wwvllm.benchmarks.speculative TARGET --draft DRAFT` for a warmed, single-request comparison. Draft and target load simultaneously in both modes, so this measures decoding rather than the full memory/initialization cost of enabling speculation. It does not replace multi-load or repeated statistical benchmarking.
+
+## Stage 3 models and quantization
+
+The model registry supports Qwen3, Llama and Qwen3-MoE with standard full attention, SiLU and unscaled RoPE. Unsupported attention/RoPE configurations are rejected. Qwen3-MoE uses a single-GPU PyTorch expert backend and automatically runs eagerly. Dense floating-point tensor parallelism retains its original path.
+
+`LLM(path, quantization='int8')` and `quantization='int4'` perform groupwise symmetric weight-only quantization of the engine's parallel linear layers **after loading a floating-point checkpoint**. Embeddings, LM head and MoE expert/router `nn.Linear` layers stay floating point. The CUDA path uses a Triton W8A16/W4A16 GEMM. This approach needs enough temporary memory for the floating model during load; the final weight savings do not describe peak initialization memory. `quant_group_size` defaults to 128. Quantization currently requires TP=1.
+
+A checkpoint with `quantization_config` declaring 4-bit AWQ GEMM with explicit zero points or legacy GPTQ is detected automatically; it is loaded into the same groupwise runtime layout. These adapters currently cover the explicit layouts in `quantization/formats.py`, including GPTQ `g_idx`; unsupported variants and quantized MoE experts are rejected. They have been tested with generated checkpoints, not a third-party production AWQ/GPTQ checkpoint. All checkpoint paths require safetensors and strict parameter coverage.
+
+See [stage 3 notes](docs/阶段三改造说明.md) and [measured results](benchmarks/STAGE3_RESULTS.md) for support boundaries, numerical tests, and observed slowdowns.

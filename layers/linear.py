@@ -45,6 +45,8 @@ class ReplicatedLinear(LinearBase):
         super().__init__(input_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if param.shape != loaded_weight.shape:
+            raise ValueError(f"weight shape mismatch: {tuple(loaded_weight.shape)} != {tuple(param.shape)}")
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -65,8 +67,12 @@ class ColumnParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
+        if loaded_weight.size(self.tp_dim) != shard_size * self.tp_size:
+            raise ValueError("checkpoint tensor has incorrect tensor-parallel dimension")
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        if param_data.shape != loaded_weight.shape:
+            raise ValueError(f"weight shape mismatch: {tuple(loaded_weight.shape)} != {tuple(param_data.shape)}")
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,6 +96,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        if param_data.shape != loaded_weight.shape:
+            raise ValueError(f"weight shape mismatch: {tuple(loaded_weight.shape)} != {tuple(param_data.shape)}")
         param_data.copy_(loaded_weight)
 
 
@@ -125,6 +133,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        if param_data.shape != loaded_weight.shape:
+            raise ValueError(f"weight shape mismatch: {tuple(loaded_weight.shape)} != {tuple(param_data.shape)}")
         param_data.copy_(loaded_weight)
 
 
@@ -142,11 +152,17 @@ class RowParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if param_data.ndim == 1:
+            if param_data.shape != loaded_weight.shape:
+                raise ValueError(f"weight shape mismatch: {tuple(loaded_weight.shape)} != {tuple(param_data.shape)}")
             param_data.copy_(loaded_weight)
             return
         shard_size = param_data.size(self.tp_dim)
+        if loaded_weight.size(self.tp_dim) != shard_size * self.tp_size:
+            raise ValueError("checkpoint tensor has incorrect tensor-parallel dimension")
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        if param_data.shape != loaded_weight.shape:
+            raise ValueError(f"weight shape mismatch: {tuple(loaded_weight.shape)} != {tuple(param_data.shape)}")
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

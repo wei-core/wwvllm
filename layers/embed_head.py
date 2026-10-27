@@ -27,8 +27,12 @@ class VocabParallelEmbedding(nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         shard_size = param_data.size(0)
+        if loaded_weight.size(0) != shard_size * self.tp_size:
+            raise ValueError("embedding has incorrect vocabulary size")
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+        if param_data.shape != loaded_weight.shape:
+            raise ValueError(f"weight shape mismatch: {tuple(loaded_weight.shape)} != {tuple(param_data.shape)}")
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
