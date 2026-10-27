@@ -52,3 +52,25 @@ def test_async_results_stream_and_cancel(monkeypatch):
             except asyncio.CancelledError:
                 pass
     asyncio.run(run())
+
+
+def test_stream_receives_multiple_tokens_from_one_step(monkeypatch):
+    class MultiTokenEngine(FakeEngine):
+        def step(self):
+            self.last_events = []
+            for seq in self.seqs[:]:
+                for i in range(2):
+                    seq.append_token(42 + i)
+                    seq.token_timestamps.append(1.0)
+                    done = seq.num_completion_tokens == seq.max_tokens
+                    self.last_events.append((seq, 42 + i, done))
+                    if done:
+                        self.seqs.remove(seq)
+                        break
+    monkeypatch.setattr(llm_engine, 'LLMEngine', MultiTokenEngine)
+    async def run():
+        async with AsyncLLMEngine('fake') as engine:
+            handle = engine.submit([1], SamplingParams(max_tokens=2))
+            assert [token async for token in handle.stream()] == [42, 43]
+            assert (await handle.result())['token_ids'] == [42, 43]
+    asyncio.run(run())

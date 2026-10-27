@@ -131,7 +131,9 @@ class AsyncLLMEngine:
                             result = {"request_id": seq.request_id, "token_ids": seq.completion_token_ids,
                                       "text": engine.tokenizer.decode(seq.completion_token_ids),
                                       "arrival_time": seq.arrival_time, "token_timestamps": seq.token_timestamps,
-                                      "finish_time": seq.finish_time, "preemption_count": seq.preemption_count}
+                                      "finish_time": seq.finish_time, "preemption_count": seq.preemption_count,
+                                      "draft_proposed": seq.draft_proposed, "draft_accepted": seq.draft_accepted,
+                                      "target_verifications": seq.target_verifications}
                         self.loop.call_soon_threadsafe(self._deliver, handle, token, result)
         except BaseException as exc:
             if not self.ready.done():

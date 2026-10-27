@@ -1,10 +1,18 @@
 """Opt-in real-model test: WWVLLM_TEST_MODEL=/path/to/model pytest tests/test_gpu_integration.py."""
 import os
+import subprocess
+import sys
 import pytest
 
 
 @pytest.mark.skipif(not os.getenv('WWVLLM_TEST_MODEL'), reason='set WWVLLM_TEST_MODEL to a local Qwen3 model')
 def test_mixed_matches_unchunked_with_decode_graph():
+    # CUDA graph pools and torch.compile caches outlive an engine in-process.
+    # Isolate this test so subsequent GPU model tests have their full memory budget.
+    if not os.getenv('WWVLLM_GPU_TEST_CHILD'):
+        env = dict(os.environ, WWVLLM_GPU_TEST_CHILD='1')
+        subprocess.run([sys.executable, '-m', 'pytest', '-q', __file__], env=env, check=True)
+        return
     from wwvllm import LLM, SamplingParams
     llm = LLM(os.environ['WWVLLM_TEST_MODEL'], max_num_batched_tokens=128,
               prefill_chunk_size=128, max_model_len=256, max_num_seqs=4,

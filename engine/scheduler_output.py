@@ -5,6 +5,7 @@ from enum import Enum, auto
 class ExecutionMode(Enum):
     PREFILL = auto()
     DECODE = auto()
+    SPECULATIVE = auto()
 
 
 @dataclass
@@ -13,6 +14,7 @@ class ScheduledRequest:
     num_scheduled_tokens: int
     mode: ExecutionMode
     should_sample: bool
+    transaction: object = None
 
 
 @dataclass
@@ -26,4 +28,4 @@ class SchedulerOutput:
 
     @property
     def has_decode(self):
-        return any(item.mode == ExecutionMode.DECODE for item in self.scheduled)
+        return any(item.mode in (ExecutionMode.DECODE, ExecutionMode.SPECULATIVE) for item in self.scheduled)

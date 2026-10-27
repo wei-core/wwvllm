@@ -1,4 +1,5 @@
 import pickle
+from copy import copy
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -10,6 +11,7 @@ from wwvllm.models.qwen3 import Qwen3ForCausalLM
 from wwvllm.layers.sampler import Sampler
 from wwvllm.utils.context import set_context, get_context, reset_context
 from wwvllm.utils.loader import load_model
+from wwvllm.layers.speculative_sampler import probabilities, sample, verify
 
 
 class ModelRunner:
@@ -26,17 +28,30 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        try:
+            torch.set_default_dtype(hf_config.dtype)
+            torch.set_default_device("cuda")
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
+            self.sampler = Sampler()
+            self.draft_runner = None
+            if config.enable_speculative:
+                from wwvllm.engine.draft_runner import DraftRunner
+                torch.set_default_device("cpu")
+                try:
+                    self.draft_runner = DraftRunner(config.speculative_model, hf_config.dtype)
+                finally:
+                    torch.set_default_device("cuda")
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        except BaseException:
+            dist.destroy_process_group()
+            raise
+        finally:
+            torch.set_default_device("cpu")
+            torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
@@ -54,8 +69,10 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.graphs, self.graph_pool, self.graph_vars
         torch.cuda.synchronize()
+        del self.model, self.kv_cache, self.draft_runner
+        torch.cuda.empty_cache()
         dist.destroy_process_group()
 
     def loop(self):
@@ -110,8 +127,10 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        draft_reserve = int(total * config.draft_memory_reserve) if config.enable_speculative else 0
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current - draft_reserve) // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            raise RuntimeError("insufficient GPU memory for target KV cache and draft reservation")
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -221,8 +240,36 @@ class ModelRunner:
         temperatures = self.prepare_sample([seq for seq, flag in zip(seqs, sample_flags) if flag]) if self.rank == 0 else None
         try:
             logits = self.run_model(input_ids, positions, is_prefill)
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 and any(sample_flags) else []
+            if self.rank == 0 and any(sample_flags):
+                sampled_seqs = [seq for seq, flag in zip(seqs, sample_flags) if flag]
+                if any(seq.top_k or seq.top_p < 1 for seq in sampled_seqs):
+                    token_ids = []
+                    for row, seq in zip(logits, sampled_seqs):
+                        probs = probabilities(row, seq.temperature, seq.top_k, seq.top_p)
+                        token_ids.append(int(probs.argmax()) if seq.temperature == 0 else sample(probs))
+                else:
+                    token_ids = self.sampler(logits, temperatures).tolist()
+            else:
+                token_ids = []
             return token_ids
+        finally:
+            reset_context()
+
+    @torch.inference_mode()
+    def run_speculative(self, seq, count):
+        if self.draft_runner is None:
+            raise RuntimeError("draft model is not loaded")
+        draft_ids, draft_probs = self.draft_runner.propose(seq, count)
+        verify_seq = copy(seq)
+        verify_seq.token_ids = seq.token_ids + draft_ids
+        verify_seq.num_tokens = len(verify_seq.token_ids)
+        verify_seq.num_scheduled_tokens = count + 1
+        input_ids, positions = self.prepare_prefill([verify_seq], [True])
+        try:
+            get_context().sample_indices = torch.arange(count + 1, device="cuda")
+            logits = self.run_model(input_ids, positions, True)
+            target_probs = [probabilities(row, seq.temperature, seq.top_k, seq.top_p) for row in logits]
+            return verify(draft_ids, draft_probs, target_probs, greedy=seq.temperature == 0)
         finally:
             reset_context()
 

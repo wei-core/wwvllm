@@ -39,6 +39,12 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.top_k = sampling_params.top_k
+        self.top_p = sampling_params.top_p
+        self.speculative_enabled = sampling_params.speculative
+        self.draft_proposed = 0
+        self.draft_accepted = 0
+        self.target_verifications = 0
 
     def __len__(self):
         return self.num_tokens

@@ -100,3 +100,42 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def begin_transaction(self, seq: Sequence, end: int):
+        """Reserve speculative slots without changing the committed KV cursor."""
+        if getattr(seq, '_kv_transaction', None) is not None:
+            raise RuntimeError('sequence already has an active KV transaction')
+        old_blocks = len(seq.block_table)
+        if end < seq.num_cached_tokens or not self.reserve(seq, end):
+            return None
+        transaction = KVTransaction(seq, seq.num_cached_tokens, old_blocks, end)
+        seq._kv_transaction = transaction
+        return transaction
+
+    def finish_transaction(self, transaction, committed_end: int):
+        seq = transaction.seq
+        if not transaction.active or getattr(seq, '_kv_transaction', None) is not transaction:
+            raise RuntimeError('inactive KV transaction')
+        if not transaction.old_cached_len <= committed_end <= transaction.reserved_end:
+            raise ValueError('commit outside reserved KV range')
+        keep = max(transaction.old_blocks, (committed_end + self.block_size - 1) // self.block_size)
+        for block_id in reversed(seq.block_table[keep:]):
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        del seq.block_table[keep:]
+        transaction.active = False
+        seq._kv_transaction = None
+
+    def rollback_transaction(self, transaction):
+        self.finish_transaction(transaction, transaction.old_cached_len)
+
+
+class KVTransaction:
+    def __init__(self, seq, old_cached_len, old_blocks, reserved_end):
+        self.seq = seq
+        self.old_cached_len = old_cached_len
+        self.old_blocks = old_blocks
+        self.reserved_end = reserved_end
+        self.active = True

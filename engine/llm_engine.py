@@ -10,6 +10,7 @@ from wwvllm.sampling_params import SamplingParams
 from wwvllm.engine.sequence import Sequence
 from wwvllm.engine.scheduler import Scheduler
 from wwvllm.engine.model_runner import ModelRunner
+from wwvllm.engine.scheduler_output import ExecutionMode
 
 
 class LLMEngine:
@@ -18,6 +19,19 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        if config.enable_speculative:
+            from transformers import AutoConfig
+            draft_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
+            draft_config = AutoConfig.from_pretrained(config.speculative_model)
+            if (self.tokenizer.get_vocab() != draft_tokenizer.get_vocab()
+                    or self.tokenizer.all_special_ids != draft_tokenizer.all_special_ids
+                    or config.hf_config.vocab_size != draft_config.vocab_size):
+                raise ValueError("draft and target tokenizers and vocabularies must match")
+            if draft_config.model_type != "qwen3":
+                raise ValueError("draft model must be a Qwen3 causal language model")
+            if config.max_model_len > draft_config.max_position_embeddings:
+                raise ValueError("draft model context is shorter than max_model_len")
         Sequence.block_size = config.kvcache_block_size
         self.config = config
         self._closed = False
@@ -31,7 +45,6 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
@@ -56,10 +69,24 @@ class LLMEngine:
 
     def step(self):
         output = self.scheduler.schedule()
-        seqs = [item.seq for item in output.scheduled]
-        flags = [item.should_sample for item in output.scheduled]
-        token_ids = self.model_runner.call("run", seqs, output.has_prefill, flags)
-        self.last_events = self.scheduler.postprocess(output, token_ids)
+        normal = [item for item in output.scheduled if item.mode != ExecutionMode.SPECULATIVE]
+        speculative = [item for item in output.scheduled if item.mode == ExecutionMode.SPECULATIVE]
+        try:
+            token_ids = []
+            if normal:
+                seqs = [item.seq for item in normal]
+                flags = [item.should_sample for item in normal]
+                has_prefill = any(item.mode == ExecutionMode.PREFILL for item in normal)
+                token_ids = self.model_runner.call("run", seqs, has_prefill, flags)
+            results = {item.seq.seq_id: self.model_runner.call("run_speculative", item.seq, item.num_scheduled_tokens - 1)
+                       for item in speculative}
+            self.last_events = self.scheduler.postprocess(output, token_ids, results)
+        except BaseException:
+            for item in speculative:
+                if item.transaction.active:
+                    self.scheduler.block_manager.rollback_transaction(item.transaction)
+                    item.seq.num_scheduled_tokens = 0
+            raise
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq, _, finished in self.last_events if finished]
         num_tokens = output.num_scheduled_tokens if output.has_prefill else -output.num_scheduled_tokens
         return outputs, num_tokens
