@@ -1,5 +1,7 @@
 # wwvllm
 
+魔改vllm。
+
 Qwen3 inference with paged KV cache, prefix reuse, chunked prefill and mixed prefill/decode scheduling. All imports refer to this repository's `wwvllm` package; run commands from its parent or add that parent to `PYTHONPATH`. Requires PyTorch, Transformers, Triton, FlashAttention with paged KV support, xxhash and NumPy; CUDA and a local Qwen3 model are required for inference.
 
 ```python
