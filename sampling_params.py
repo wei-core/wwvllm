@@ -8,4 +8,5 @@ class SamplingParams:
     ignore_eos: bool = False
 
     def __post_init__(self):
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        if self.temperature < 0 or self.max_tokens < 1:
+            raise ValueError("temperature must be non-negative and max_tokens must be positive")

@@ -5,11 +5,11 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
-from nanovllm.config import Config
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from wwvllm.config import Config
+from wwvllm.sampling_params import SamplingParams
+from wwvllm.engine.sequence import Sequence
+from wwvllm.engine.scheduler import Scheduler
+from wwvllm.engine.model_runner import ModelRunner
 
 
 class LLMEngine:
@@ -19,6 +19,8 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
+        self.config = config
+        self._closed = False
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -35,6 +37,9 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if self._closed:
+            return
+        self._closed = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -43,15 +48,20 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        if len(prompt) + sampling_params.max_tokens > self.config.max_model_len:
+            raise ValueError("prompt and output exceed max_model_len")
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        output = self.scheduler.schedule()
+        seqs = [item.seq for item in output.scheduled]
+        flags = [item.should_sample for item in output.scheduled]
+        token_ids = self.model_runner.call("run", seqs, output.has_prefill, flags)
+        self.last_events = self.scheduler.postprocess(output, token_ids)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq, _, finished in self.last_events if finished]
+        num_tokens = output.num_scheduled_tokens if output.has_prefill else -output.num_scheduled_tokens
         return outputs, num_tokens
 
     def is_finished(self):
@@ -66,6 +76,8 @@ class LLMEngine:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        if len(prompts) != len(sampling_params):
+            raise ValueError("one sampling parameter set is required per prompt")
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}

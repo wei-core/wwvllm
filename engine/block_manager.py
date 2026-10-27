@@ -2,7 +2,7 @@ from collections import deque
 import xxhash
 import numpy as np
 
-from nanovllm.engine.sequence import Sequence
+from wwvllm.engine.sequence import Sequence
 
 
 class Block:
@@ -55,41 +55,30 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def attach_prefix(self, seq: Sequence):
+        """Attach only complete cached blocks; leave a token to compute for sampling."""
         h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+        for i in range((seq.num_tokens - 1) // self.block_size):
+            tokens = seq.block(i)
+            h = self.compute_hash(tokens, h)
+            block_id = self.hash_to_block_id.get(h)
+            if block_id is None or self.blocks[block_id].token_ids != tokens:
                 break
-            num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
-
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
-        assert not seq.block_table
-        h = -1
-        for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
-            if block_id in self.used_block_ids:
-                block.ref_count += 1
-            else:
-                block.ref_count = 1
+            if block.ref_count == 0:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
+            block.ref_count += 1
             seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
+            seq.num_cached_tokens += self.block_size
+
+    def reserve(self, seq: Sequence, end: int) -> bool:
+        needed = max(0, (end + self.block_size - 1) // self.block_size - len(seq.block_table))
+        if needed > len(self.free_block_ids):
+            return False
+        for _ in range(needed):
             seq.block_table.append(self._allocate_block())
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        return True
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -99,13 +88,6 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
-
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
-
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
-            seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size

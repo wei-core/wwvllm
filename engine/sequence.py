@@ -1,14 +1,17 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from time import monotonic
 
-from nanovllm.sampling_params import SamplingParams
+from wwvllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+    CANCELLED = auto()
+    FAILED = auto()
 
 
 class Sequence:
@@ -16,7 +19,14 @@ class Sequence:
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+        if not token_ids:
+            raise ValueError("prompt must contain at least one token")
         self.seq_id = next(Sequence.counter)
+        self.request_id = str(self.seq_id)
+        self.arrival_time = monotonic()
+        self.token_timestamps = []
+        self.finish_time = None
+        self.preemption_count = 0
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
@@ -38,7 +48,7 @@ class Sequence:
 
     @property
     def is_finished(self):
-        return self.status == SequenceStatus.FINISHED
+        return self.status in (SequenceStatus.FINISHED, SequenceStatus.CANCELLED, SequenceStatus.FAILED)
 
     @property
     def num_completion_tokens(self):
@@ -70,14 +80,8 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        # Workers need arbitrary token slices after chunking or recomputation.
+        return self.__dict__
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
-        if isinstance(last_state, list):
-            self.token_ids = last_state
-            self.last_token = self.token_ids[-1]
-        else:
-            self.token_ids = []
-            self.last_token = last_state
+        self.__dict__.update(state)

@@ -4,12 +4,12 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from wwvllm.config import Config
+from wwvllm.engine.sequence import Sequence
+from wwvllm.models.qwen3 import Qwen3ForCausalLM
+from wwvllm.layers.sampler import Sampler
+from wwvllm.utils.context import set_context, get_context, reset_context
+from wwvllm.utils.loader import load_model
 
 
 class ModelRunner:
@@ -126,7 +126,7 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence], sample_flags=None):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -161,12 +161,16 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        sample_indices_list = [cu_seqlens_q[i + 1] - 1 for i, flag in enumerate(sample_flags or [True] * len(seqs)) if flag]
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        if sample_flags is None:
+            sample_flags = [True] * len(seqs)
+        sample_indices = torch.tensor(sample_indices_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, sample_indices)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -211,13 +215,16 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
-        return token_ids
+    def run(self, seqs: list[Sequence], is_prefill: bool, sample_flags=None) -> list[int]:
+        sample_flags = sample_flags if sample_flags is not None else [True] * len(seqs)
+        input_ids, positions = self.prepare_prefill(seqs, sample_flags) if is_prefill else self.prepare_decode(seqs)
+        temperatures = self.prepare_sample([seq for seq, flag in zip(seqs, sample_flags) if flag]) if self.rank == 0 else None
+        try:
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 and any(sample_flags) else []
+            return token_ids
+        finally:
+            reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -231,7 +238,7 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = sorted(set([x for x in [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) if x <= max_bs] + [max_bs]))
         self.graphs = {}
         self.graph_pool = None
 
