@@ -54,3 +54,7 @@ The model registry supports Qwen3, Llama and Qwen3-MoE with standard full attent
 A checkpoint with `quantization_config` declaring 4-bit AWQ GEMM with explicit zero points or legacy GPTQ is detected automatically; it is loaded into the same groupwise runtime layout. These adapters currently cover the explicit layouts in `quantization/formats.py`, including GPTQ `g_idx`; unsupported variants and quantized MoE experts are rejected. They have been tested with generated checkpoints, not a third-party production AWQ/GPTQ checkpoint. All checkpoint paths require safetensors and strict parameter coverage.
 
 See [stage 3 notes](docs/阶段三改造说明.md) and [measured results](benchmarks/STAGE3_RESULTS.md) for support boundaries, numerical tests, and observed slowdowns.
+
+## Optional mixed-batch CUDA Graph cache
+
+`enable_mixed_graph=True` enables bounded, lazy CUDA Graph reuse for eligible Qwen3 mixed prefill/decode batches on a single GPU with floating-point weights and CUDA Graph enabled. `max_mixed_graphs` defaults to 16. The default remains off: unfamiliar shapes incur capture cost and graph allocations, and cache eviction can cause recapture. Pure prefill, pure decode, tensor-parallel, quantized, other-architecture and eager paths retain their existing execution behavior. See [the optimization report](docs/性能调优/阶段一/03-混合图复用/README.md) for measured warm and cold results, limitations and reproduction.

@@ -1,5 +1,6 @@
 import pickle
 from copy import copy
+from collections import OrderedDict
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -23,6 +24,9 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager or getattr(config.hf_config, "model_type", None) == "qwen3_moe"
         self.world_size = config.tensor_parallel_size
         self.rank = rank
+        self.enable_mixed_graph = config.enable_mixed_graph
+        self.mixed_graphs = OrderedDict()
+        self.mixed_graph_stats = {"captures": 0, "replays": 0, "evictions": 0}
         self.event = event
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
@@ -78,6 +82,7 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool, self.graph_vars
         torch.cuda.synchronize()
+        self.mixed_graphs.clear()
         del self.model, self.kv_cache, self.draft_runner
         torch.cuda.empty_cache()
         dist.destroy_process_group()
@@ -241,12 +246,70 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
+    def run_mixed_graph(self, input_ids, positions):
+        context = get_context()
+        assert context.is_prefill and context.block_tables is not None
+        bs = context.cu_seqlens_q.numel() - 1
+        # Capture exact metadata shapes and host-side attention bounds.
+        key = (input_ids.numel(), bs, context.max_seqlen_q,
+               context.max_seqlen_k, context.block_tables.size(1))
+        cached = self.mixed_graphs.get(key)
+        if cached is None:
+            ids = torch.empty_like(input_ids)
+            pos = torch.empty_like(positions)
+            qlens = torch.empty_like(context.cu_seqlens_q)
+            klens = torch.empty_like(context.cu_seqlens_k)
+            slots = torch.empty_like(context.slot_mapping)
+            tables = torch.empty_like(context.block_tables)
+            cached = dict(ids=ids, pos=pos, qlens=qlens, klens=klens, slots=slots, tables=tables)
+        for name, value in [('ids', input_ids), ('pos', positions),
+                            ('qlens', context.cu_seqlens_q), ('klens', context.cu_seqlens_k),
+                            ('slots', context.slot_mapping), ('tables', context.block_tables)]:
+            cached[name].copy_(value)
+        if 'graph' not in cached:
+            # Each warmup/capture uses the real input and writes the same KV
+            # values as replay; no candidate or sampling state is advanced.
+            set_context(True, cached['qlens'], cached['klens'], context.max_seqlen_q,
+                        context.max_seqlen_k, cached['slots'], None, cached['tables'])
+            try:
+                self.model(cached['ids'], cached['pos'])
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs = self.model(cached['ids'], cached['pos'])
+                cached['graph'] = graph
+                cached['outputs'] = outputs
+            finally:
+                set_context(context.is_prefill, context.cu_seqlens_q, context.cu_seqlens_k,
+                            context.max_seqlen_q, context.max_seqlen_k, context.slot_mapping,
+                            context.context_lens, context.block_tables, context.sample_indices)
+            self.mixed_graph_stats['captures'] += 1
+            self.mixed_graphs[key] = cached
+            if len(self.mixed_graphs) > self.config.max_mixed_graphs:
+                self.mixed_graphs.popitem(last=False)
+                self.mixed_graph_stats['evictions'] += 1
+        else:
+            self.mixed_graphs.move_to_end(key)
+        cached['graph'].replay()
+        self.mixed_graph_stats['replays'] += 1
+        return self.model.compute_logits(cached['outputs'])
+
     def run(self, seqs: list[Sequence], is_prefill: bool, sample_flags=None) -> list[int]:
         sample_flags = sample_flags if sample_flags is not None else [True] * len(seqs)
         input_ids, positions = self.prepare_prefill(seqs, sample_flags) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample([seq for seq, flag in zip(seqs, sample_flags) if flag]) if self.rank == 0 else None
         try:
-            logits = self.run_model(input_ids, positions, is_prefill)
+            mixed = False
+            if (self.enable_mixed_graph and self.world_size == 1 and not self.config.quantization
+                    and getattr(self.config.hf_config, 'model_type', None) == 'qwen3'
+                    and not self.enforce_eager and is_prefill):
+                decode_flags = [s.num_cached_tokens >= s.num_prompt_tokens and
+                                s.num_tokens - s.num_cached_tokens == 1 and s.num_scheduled_tokens == 1
+                                for s in seqs]
+                mixed = any(decode_flags) and not all(decode_flags)
+            logits = (self.run_mixed_graph(input_ids, positions) if mixed
+                      else self.run_model(input_ids, positions, is_prefill))
             if self.rank == 0 and any(sample_flags):
                 sampled_seqs = [seq for seq, flag in zip(seqs, sample_flags) if flag]
                 if any(seq.top_k or seq.top_p < 1 for seq in sampled_seqs):

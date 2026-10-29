@@ -20,6 +20,8 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    enable_mixed_graph: bool = False
+    max_mixed_graphs: int = 16
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -28,6 +30,8 @@ class Config:
     def __post_init__(self):
         if min(self.max_num_batched_tokens, self.max_num_seqs, self.prefill_chunk_size, self.max_pending_requests) < 1:
             raise ValueError("scheduler limits must be positive")
+        if self.max_mixed_graphs < 1:
+            raise ValueError("max_mixed_graphs must be positive")
         if self.quantization not in (None, 'int8', 'int4', 'awq', 'gptq') or self.quant_group_size < 1:
             raise ValueError("quantization must be None, int8, int4, awq or gptq; group size must be positive")
         if self.quantization and self.tensor_parallel_size != 1:
