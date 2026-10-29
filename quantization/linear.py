@@ -81,9 +81,12 @@ class QuantizedLinear(nn.Module):
         x = x.reshape(-1, self.in_features).contiguous()
         if x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
             out = torch.empty((x.shape[0], self.out_features), dtype=x.dtype, device=x.device)
-            _quant_gemm[(triton.cdiv(x.shape[0], 16), triton.cdiv(self.out_features, 32))](
+            # Larger prefill batches benefit from reusing each weight tile across
+            # more rows; retain the original tile for small decode batches.
+            block_m = 32 if x.shape[0] >= 64 else 16
+            _quant_gemm[(triton.cdiv(x.shape[0], block_m), triton.cdiv(self.out_features, 32))](
                 x, self.qweight, self.scales, self.zeros, self.g_idx, out, x.shape[0], self.out_features, self.in_features,
-                self.group_size, self.scales.shape[1], self.bits == 4, 16, 32, 32)
+                self.group_size, self.scales.shape[1], self.bits == 4, block_m, 32, 32)
             if self.bias is not None:
                 out = out + self.bias
         else:

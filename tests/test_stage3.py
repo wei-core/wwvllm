@@ -112,3 +112,17 @@ def test_strict_loader_missing_and_shape_mismatch(tmp_path):
     save_file({'0.weight': torch.ones(2, 3), '0.bias': torch.ones(2)}, str(path))
     load_model(model, tmp_path)
     assert torch.equal(model[0].weight, torch.ones(2, 3))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+@pytest.mark.parametrize('bits', [4, 8])
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+def test_quantized_large_batch_arbitrary_groups(bits, dtype):
+    torch.manual_seed(42)
+    q = QuantizedLinear.from_float(torch.nn.Linear(37, 51, device='cuda', dtype=dtype), bits, 8)
+    q.g_idx.copy_(torch.randint(0, q.scales.shape[1], (37,), device='cuda', dtype=torch.int32))
+    q.zeros.copy_(torch.randint(0, 12, q.zeros.shape, device='cuda').to(q.zeros.dtype))
+    for m in (4, 63, 64, 129):
+        x = torch.randn(m, 37, device='cuda', dtype=dtype)
+        torch.testing.assert_close(q(x), torch.nn.functional.linear(x, q.dequantize(dtype), q.bias),
+                                   atol=.03, rtol=.03)
