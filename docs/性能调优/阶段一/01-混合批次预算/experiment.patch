@@ -1,0 +1,182 @@
+diff --git a/config.py b/config.py
+index a7e071e..dbfb8ee 100644
+--- a/config.py
++++ b/config.py
+@@ -11,6 +11,7 @@ class Config:
+     quantization: str | None = None
+     quant_group_size: int = 128
+     prefill_chunk_size: int = 512
++    max_mixed_prefill_tokens: int = 0
+     max_pending_requests: int = 1024
+     enable_speculative: bool = False
+     speculative_model: str | None = None
+@@ -28,6 +29,8 @@ class Config:
+     def __post_init__(self):
+         if min(self.max_num_batched_tokens, self.max_num_seqs, self.prefill_chunk_size, self.max_pending_requests) < 1:
+             raise ValueError("scheduler limits must be positive")
++        if self.max_mixed_prefill_tokens < 0:
++            raise ValueError("max_mixed_prefill_tokens must be non-negative")
+         if self.quantization not in (None, 'int8', 'int4', 'awq', 'gptq') or self.quant_group_size < 1:
+             raise ValueError("quantization must be None, int8, int4, awq or gptq; group size must be positive")
+         if self.quantization and self.tensor_parallel_size != 1:
+diff --git a/engine/scheduler.py b/engine/scheduler.py
+index 8e7597b..892fa8f 100644
+--- a/engine/scheduler.py
++++ b/engine/scheduler.py
+@@ -11,6 +11,7 @@ class Scheduler:
+         self.max_num_seqs = config.max_num_seqs
+         self.max_num_batched_tokens = config.max_num_batched_tokens
+         self.chunk_size = config.prefill_chunk_size
++        self.max_mixed_prefill_tokens = getattr(config, "max_mixed_prefill_tokens", 0)
+         self.eos = config.eos
+         self.enable_speculative = getattr(config, "enable_speculative", False)
+         self.speculative_num_tokens = getattr(config, "speculative_num_tokens", 0)
+@@ -47,12 +48,20 @@ class Scheduler:
+     def schedule(self):
+         budget = self.max_num_batched_tokens
+         scheduled = []
+-        # Decode is latency sensitive. Incomplete prefill requests rotate behind it.
+-        candidates = sorted(self.running, key=lambda s: s.num_cached_tokens < s.num_prompt_tokens)
++        prefill_tokens = 0
++        has_decode = False
++
++        def is_decode(seq):
++            return seq.num_cached_tokens >= seq.num_prompt_tokens and seq.num_tokens - seq.num_cached_tokens == 1
++
++        # When a mixed-batch cap is active, place actual decode requests before
++        # recomputation as well as ordinary partial prefill requests.
++        candidates = sorted(self.running, key=(lambda s: not is_decode(s)) if self.max_mixed_prefill_tokens
++                            else (lambda s: s.num_cached_tokens < s.num_prompt_tokens))
+         for seq in candidates:
+             if budget == 0 or len(scheduled) >= self.max_num_seqs:
+                 break
+-            decode = seq.num_cached_tokens >= seq.num_prompt_tokens and seq.num_tokens - seq.num_cached_tokens == 1
++            decode = is_decode(seq)
+             capacity = (len(seq.block_table) + len(self.block_manager.free_block_ids)) * self.block_size - seq.num_cached_tokens
+             remaining_output = seq.max_tokens - seq.num_completion_tokens
+             k = min(self.speculative_num_tokens, budget - 1, capacity - 1, remaining_output - 1)
+@@ -62,20 +71,31 @@ class Scheduler:
+                     seq.num_scheduled_tokens = k + 1
+                     scheduled.append(ScheduledRequest(seq, k + 1, ExecutionMode.SPECULATIVE, True, transaction))
+                     budget -= k + 1
++                    has_decode = True
+                     continue
+             n = min(seq.num_tokens - seq.num_cached_tokens, budget, 1 if decode else self.chunk_size, capacity)
++            if not decode and has_decode and self.max_mixed_prefill_tokens:
++                n = min(n, max(0, self.max_mixed_prefill_tokens - prefill_tokens))
+             if n > 0 and self.block_manager.reserve(seq, seq.num_cached_tokens + n):
+                 seq.num_scheduled_tokens = n
+                 scheduled.append(ScheduledRequest(seq, n, ExecutionMode.DECODE if decode else ExecutionMode.PREFILL, seq.num_cached_tokens + n == seq.num_tokens))
+                 budget -= n
++                if decode:
++                    has_decode = True
++                else:
++                    prefill_tokens += n
+         # Admit new requests only when there is an active sequence slot.
+         attempts = len(self.waiting)
+         while attempts and self.waiting and budget and len(self.running) < self.max_num_seqs and len(scheduled) < self.max_num_seqs:
+             attempts -= 1
++            if has_decode and self.max_mixed_prefill_tokens and prefill_tokens >= self.max_mixed_prefill_tokens:
++                break
+             seq = self.waiting.popleft()
+             self.block_manager.attach_prefix(seq)
+             capacity = (len(seq.block_table) + len(self.block_manager.free_block_ids)) * self.block_size - seq.num_cached_tokens
+             n = min(seq.num_tokens - seq.num_cached_tokens, budget, self.chunk_size, capacity)
++            if has_decode and self.max_mixed_prefill_tokens:
++                n = min(n, self.max_mixed_prefill_tokens - prefill_tokens)
+             if n <= 0 or not self.block_manager.reserve(seq, seq.num_cached_tokens + n):
+                 self.block_manager.deallocate(seq)
+                 self.waiting.append(seq)
+@@ -85,6 +105,7 @@ class Scheduler:
+             seq.num_scheduled_tokens = n
+             scheduled.append(ScheduledRequest(seq, n, ExecutionMode.PREFILL, seq.num_cached_tokens + n == seq.num_tokens))
+             budget -= n
++            prefill_tokens += n
+         if not scheduled:
+             if self.running:
+                 # Recompute a victim later; fail explicitly if a single request cannot fit.
+diff --git a/tests/test_gpu_integration.py b/tests/test_gpu_integration.py
+index 7819b49..42c6281 100644
+--- a/tests/test_gpu_integration.py
++++ b/tests/test_gpu_integration.py
+@@ -24,5 +24,8 @@ def test_mixed_matches_unchunked_with_decode_graph():
+         llm.scheduler.chunk_size = 8
+         actual = llm.generate(prompts, params, use_tqdm=False)
+         assert [x['token_ids'] for x in actual] == [x['token_ids'] for x in reference]
++        llm.scheduler.max_mixed_prefill_tokens = 3
++        capped = llm.generate(prompts, params, use_tqdm=False)
++        assert [x['token_ids'] for x in capped] == [x['token_ids'] for x in reference]
+     finally:
+         llm.exit()
+diff --git a/tests/test_scheduler.py b/tests/test_scheduler.py
+index 1548978..cf0f9a0 100644
+--- a/tests/test_scheduler.py
++++ b/tests/test_scheduler.py
+@@ -84,3 +84,35 @@ def test_preemption_recomputes_without_duplicate_output():
+     assert s.is_finished()
+     assert len(a.completion_token_ids) == len(b.completion_token_ids) == 3
+     assert len(s.block_manager.free_block_ids) == 2
++
++
++def test_mixed_prefill_cap_preserves_pure_prefill_budget():
++    from wwvllm.engine.scheduler_output import ExecutionMode
++    s = scheduler(budget=8, chunk=8, blocks=16)
++    s.max_mixed_prefill_tokens = 3
++    a = Sequence([1, 2], SamplingParams(max_tokens=4))
++    s.add(a)
++    s.postprocess(s.schedule(), [9])
++    b = Sequence(list(range(12)))
++    c = Sequence(list(range(20, 32)))
++    s.add(b)
++    s.add(c)
++    out = s.schedule()
++    assert out.has_decode and out.has_prefill
++    assert sum(item.num_scheduled_tokens for item in out.scheduled if item.mode == ExecutionMode.PREFILL) == 3
++    assert out.num_scheduled_tokens == 4
++    s.postprocess(out, [10])
++    # Without a concurrent decode, the ordinary prefill chunk can use the full budget.
++    s.cancel(a)
++    out = s.schedule()
++    assert not out.has_decode and out.num_scheduled_tokens == 8
++
++
++def test_mixed_prefill_cap_can_be_disabled():
++    s = scheduler(budget=8, chunk=8, blocks=16)
++    a = Sequence([1, 2])
++    s.add(a)
++    s.postprocess(s.schedule(), [9])
++    s.add(Sequence(list(range(12))))
++    out = s.schedule()
++    assert out.has_decode and out.has_prefill and out.num_scheduled_tokens == 8
+diff --git a/tests/test_speculative.py b/tests/test_speculative.py
+index 9fa299a..8509625 100644
+--- a/tests/test_speculative.py
++++ b/tests/test_speculative.py
+@@ -123,3 +123,27 @@ def test_eos_truncates_accepted_proposals():
+         assert len(s.block_manager.free_block_ids) == 4
+     finally:
+         Sequence.block_size = old
++
++
++def test_speculative_decode_obeys_mixed_prefill_cap():
++    from wwvllm.engine.scheduler_output import ExecutionMode
++    old = Sequence.block_size
++    Sequence.block_size = 4
++    try:
++        config = SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=8,
++            prefill_chunk_size=8, max_mixed_prefill_tokens=3, eos=-1,
++            kvcache_block_size=4, num_kvcache_blocks=16,
++            enable_speculative=True, speculative_num_tokens=2)
++        s = Scheduler(config)
++        first = Sequence([1, 2], SamplingParams(max_tokens=6))
++        s.add(first)
++        s.postprocess(s.schedule(), [9])
++        s.add(Sequence(list(range(10))))
++        out = s.schedule()
++        assert out.has_decode and out.has_prefill
++        assert out.scheduled[0].mode == ExecutionMode.SPECULATIVE
++        assert sum(item.num_scheduled_tokens for item in out.scheduled if item.mode == ExecutionMode.PREFILL) == 3
++        assert out.num_scheduled_tokens == 6
++        s.block_manager.rollback_transaction(out.scheduled[0].transaction)
++    finally:
++        Sequence.block_size = old
