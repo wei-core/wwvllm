@@ -8,6 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from wwvllm.config import Config
 from wwvllm.core.sequence import Sequence
+from wwvllm.utils.exceptions import KVCacheMemoryError
 from wwvllm.models.registry import get_model_class
 from wwvllm.layers.sampler import Sampler
 from wwvllm.utils.context import set_context, get_context, reset_context
@@ -142,7 +143,7 @@ class ModelRunner:
         draft_reserve = int(total * config.draft_memory_reserve) if config.enable_speculative else 0
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current - draft_reserve) // block_bytes
         if config.num_kvcache_blocks <= 0:
-            raise RuntimeError("insufficient GPU memory for target KV cache and draft reservation")
+            raise KVCacheMemoryError("insufficient GPU memory for target KV cache and draft reservation")
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

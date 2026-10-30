@@ -4,6 +4,7 @@ from time import monotonic
 from wwvllm.core.sequence import SequenceStatus
 from wwvllm.core.block_manager import BlockManager
 from wwvllm.core.scheduler_output import ExecutionMode, ScheduledRequest, SchedulerOutput
+from wwvllm.utils.exceptions import KVBlockExhaustedError
 
 
 class Scheduler:
@@ -45,6 +46,12 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def schedule(self):
+        while True:
+            output = self._schedule_once()
+            if output is not None:
+                return output
+
+    def _schedule_once(self):
         budget = self.max_num_batched_tokens
         scheduled = []
         # Decode is latency sensitive. Incomplete prefill requests rotate behind it.
@@ -90,12 +97,12 @@ class Scheduler:
                 # Recompute a victim later; fail explicitly if a single request cannot fit.
                 victim = self.running[-1]
                 if len(self.running) == 1 and victim.num_tokens > len(self.block_manager.blocks) * self.block_size:
-                    raise RuntimeError("sequence exceeds KV cache capacity")
+                    raise KVBlockExhaustedError("sequence exceeds KV cache capacity")
                 if len(self.running) == 1:
-                    raise RuntimeError("insufficient KV cache to make progress")
+                    raise KVBlockExhaustedError("insufficient KV cache to make progress")
                 self.preempt(victim)
-                return self.schedule()
-            raise RuntimeError("insufficient KV cache to schedule a request")
+                return None
+            raise KVBlockExhaustedError("insufficient KV cache to schedule a request")
         # Round-robin requests within each phase.
         for item in scheduled:
             self.running.remove(item.seq)
