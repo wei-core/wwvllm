@@ -1,4 +1,4 @@
-"""Online benchmark: python -m wwvllm.benchmarks.online MODEL [options]."""
+"""Online benchmark: python benchmarks/online.py MODEL [options]."""
 import argparse
 import asyncio
 import json
